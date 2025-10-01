@@ -435,7 +435,7 @@ pub struct Block {
 }
 
 impl Block {
-    fn forward(
+    pub fn forward(
         &self,
         x: &Tensor,
         index_pos: usize,
