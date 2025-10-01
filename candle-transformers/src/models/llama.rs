@@ -426,7 +426,7 @@ impl Mlp {
 }
 
 #[derive(Debug, Clone)]
-struct Block {
+pub struct Block {
     rms_1: RmsNorm,
     attn: CausalSelfAttention,
     rms_2: RmsNorm,
@@ -474,7 +474,7 @@ impl Block {
 #[derive(Debug, Clone)]
 pub struct Llama {
     wte: Embedding,
-    blocks: Vec<Block>,
+    pub blocks: Vec<Block>,
     ln_f: RmsNorm,
     lm_head: Linear,
 }
