@@ -475,8 +475,8 @@ impl Block {
 pub struct Llama {
     wte: Embedding,
     pub blocks: Vec<Block>,
-    ln_f: RmsNorm,
-    lm_head: Linear,
+    pub ln_f: RmsNorm,
+    pub lm_head: Linear,
 }
 
 impl Llama {
