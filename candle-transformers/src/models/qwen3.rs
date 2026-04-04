@@ -387,3 +387,42 @@ impl ModelForCausalLM {
         self.base.clear_kv_cache();
     }
 }
+
+/// Qwen3 with a linear classification head (no bias) on the last token's
+/// hidden state — mirrors HuggingFace `Qwen3ForSequenceClassification`.
+#[derive(Debug, Clone)]
+pub struct ModelForSequenceClassification {
+    base: Model,
+    score: Linear,
+    num_labels: usize,
+}
+
+impl ModelForSequenceClassification {
+    pub fn new(cfg: &Config, num_labels: usize, vb: VarBuilder) -> Result<Self> {
+        let base = Model::new(cfg, vb.clone())?;
+        let score = linear_no_bias(cfg.hidden_size, num_labels, vb.pp("score"))?;
+        Ok(Self {
+            base,
+            score,
+            num_labels,
+        })
+    }
+
+    /// Returns logits of shape `(batch, num_labels)`.
+    pub fn forward(&mut self, input: &Tensor) -> Result<Tensor> {
+        let (_, l) = input.dims2()?;
+        self.base
+            .forward(input, 0)?
+            .narrow(1, l - 1, 1)?
+            .squeeze(1)?
+            .apply(&self.score)
+    }
+
+    pub fn num_labels(&self) -> usize {
+        self.num_labels
+    }
+
+    pub fn clear_kv_cache(&mut self) {
+        self.base.clear_kv_cache();
+    }
+}
