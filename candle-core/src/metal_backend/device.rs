@@ -1,12 +1,17 @@
 use crate::{DType, Result};
+
+#[cfg(feature = "ug")]
+use candle_metal_kernels::metal::ComputePipeline;
 use candle_metal_kernels::{
     metal::{
-        Buffer, BufferMap, CommandBuffer, Commands, ComputePipeline, Device, MTLResourceOptions,
+        BlitCommandEncoder, Buffer, BufferMap, Commands, ComputeCommandEncoder, Device,
+        MTLResourceOptions,
     },
     Kernels,
 };
 use objc2_foundation::NSURL;
 use objc2_metal::{MTLCaptureDescriptor, MTLCaptureDestination, MTLCaptureManager};
+
 use std::path::Path;
 use std::sync::{Arc, Mutex, RwLock};
 
@@ -51,12 +56,30 @@ pub struct MetalDevice {
     /// (strong_count = 1).
     pub(crate) buffers: Arc<RwLock<BufferMap>>,
 
+    /// Same as `buffers` but uses `PRIVATE_RESOURCE_OPTIONS` (StorageModePrivate on macOS).
+    /// Intermediate compute buffers don't need CPU access so Private avoids coherency overhead.
+    pub(crate) private_buffers: Arc<RwLock<BufferMap>>,
+
     /// Simple keeper struct to keep track of the already compiled kernels so we can reuse them.
     /// Heavily used by [`candle_metal_kernels`]
     pub(crate) kernels: Arc<Kernels>,
     /// Seed for random number generation.
     pub(crate) seed: Arc<Mutex<Buffer>>,
+    /// Last seed value set on this device.
+    pub(crate) seed_value: Arc<RwLock<u64>>,
 }
+
+// Resource options used for creating buffers. Shared storage mode allows both CPU and GPU to access the buffer.
+pub const RESOURCE_OPTIONS: MTLResourceOptions =
+    objc2_metal::MTLResourceOptions(MTLResourceOptions::StorageModeShared.bits());
+//| MTLResourceOptions::HazardTrackingModeUntracked.bits(),
+//);
+
+// Resource options used for `new_private_buffer`. This uses `private` where supported.
+#[cfg(target_os = "ios")]
+pub const PRIVATE_RESOURCE_OPTIONS: MTLResourceOptions = MTLResourceOptions::StorageModeShared;
+#[cfg(not(target_os = "ios"))]
+pub const PRIVATE_RESOURCE_OPTIONS: MTLResourceOptions = MTLResourceOptions::StorageModePrivate;
 
 impl std::fmt::Debug for MetalDevice {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -73,14 +96,14 @@ impl std::ops::Deref for MetalDevice {
 }
 
 impl MetalDevice {
-    #[cfg(all(not(target_arch = "wasm32"), not(target_os = "ios")))]
+    #[cfg(all(feature = "ug", not(target_arch = "wasm32"), not(target_os = "ios")))]
     pub fn compile(
         &self,
         func_name: &'static str,
-        kernel: ug::lang::ssa::Kernel,
+        kernel: candle_ug::lang::ssa::Kernel,
     ) -> Result<ComputePipeline> {
         let mut buf = vec![];
-        ug_metal::code_gen::gen(&mut buf, func_name, &kernel)?;
+        candle_ug::metal::code_gen::gen(&mut buf, func_name, &kernel)?;
         let metal_code = String::from_utf8(buf)?;
         let lib = self
             .device
@@ -117,17 +140,26 @@ impl MetalDevice {
         Ok(())
     }
 
-    pub fn command_buffer(&self) -> Result<CommandBuffer> {
-        let mut commands = self.commands.write().map_err(MetalError::from)?;
-        let (flushed, command_buffer) = commands.command_buffer().map_err(MetalError::from)?;
-        if flushed {
+    pub fn command_encoder(&self) -> Result<ComputeCommandEncoder> {
+        let commands = self.commands.write().map_err(MetalError::from)?;
+        let (flush, command_encoder) = commands.command_encoder().map_err(MetalError::from)?;
+        if flush {
             self.drop_unused_buffers()?
         }
-        Ok(command_buffer.clone())
+        Ok(command_encoder)
+    }
+
+    pub fn blit_command_encoder(&self) -> Result<BlitCommandEncoder> {
+        let commands = self.commands.write().map_err(MetalError::from)?;
+        let (flush, command_encoder) = commands.blit_command_encoder().map_err(MetalError::from)?;
+        if flush {
+            self.drop_unused_buffers()?
+        }
+        Ok(command_encoder)
     }
 
     pub fn wait_until_completed(&self) -> Result<()> {
-        let mut commands = self.commands.write().map_err(MetalError::from)?;
+        let commands = self.commands.write().map_err(MetalError::from)?;
         commands.wait_until_completed().map_err(MetalError::from)?;
         Ok(())
     }
@@ -141,31 +173,50 @@ impl MetalDevice {
     }
 
     /// Creates a new buffer (not necessarily zeroed).
-    /// The buffer is [MTLPrivate](https://developer.apple.com/documentation/metal/mtlstoragemode)
-    /// This means the buffer data cannot be read on the CPU directly.
     ///
-    /// [`name`] is only used to keep track of the resource origin in case of bugs
+    /// Uses StorageModePrivate on macOS for faster GPU access (no CPU coherency overhead).
+    /// Falls back to StorageModeShared on iOS where Private is not always available.
     pub fn new_buffer(
         &self,
         element_count: usize,
         dtype: DType,
-        name: &str,
+        _name: &str,
     ) -> Result<Arc<Buffer>> {
         let size = element_count * dtype.size_in_bytes();
-        self.allocate_buffer(size, MTLResourceOptions::StorageModePrivate, name)
+        let mut buffers = self.private_buffers.write().map_err(MetalError::from)?;
+        if let Some(b) = find_available_buffer(size, &buffers) {
+            return Ok(b.clone());
+        }
+        let size = buf_size(size);
+        let subbuffers = buffers.entry(size).or_insert(vec![]);
+
+        let new_buffer = self
+            .device
+            .new_buffer(size, PRIVATE_RESOURCE_OPTIONS)
+            .map_err(MetalError::from)?;
+        let new_buffer = Arc::new(new_buffer);
+        subbuffers.push(new_buffer.clone());
+        Ok(new_buffer)
     }
 
-    /// Creates a new buffer (not necessarily zeroed).
-    /// The buffer is [MTLManaged](https://developer.apple.com/documentation/metal/mtlstoragemode)
-    /// This means the buffer can be read on the CPU but will require manual
-    /// synchronization when the CPU memory is modified
-    /// Used as a bridge to gather data back from the GPU
-    pub fn new_buffer_managed(&self, size: usize) -> Result<Arc<Buffer>> {
-        self.allocate_buffer(size, MTLResourceOptions::StorageModeManaged, "managed")
+    /// Creates a new private buffer (not necessarily zeroed).
+    ///
+    /// This is intentionally not in the Metal buffer pool to allow the efficient implementation of persistent buffers.
+    pub fn new_private_buffer(
+        &self,
+        element_count: usize,
+        dtype: DType,
+        _name: &str,
+    ) -> Result<Arc<Buffer>> {
+        let size = element_count * dtype.size_in_bytes();
+        let buffer = self
+            .device
+            .new_buffer(size, PRIVATE_RESOURCE_OPTIONS)
+            .map_err(MetalError::from)?;
+        Ok(Arc::new(buffer))
     }
 
     /// Creates a new buffer from data.
-    /// The buffer is [MTLManaged](https://developer.apple.com/documentation/metal/mtlstoragemode)
     ///
     /// Does not require synchronization, as [newBufferWithBytes](https://developer.apple.com/documentation/metal/mtldevice/1433429-newbufferwithbytes)
     /// allocates the buffer and copies over the existing data before returning the MTLBuffer.
@@ -173,17 +224,11 @@ impl MetalDevice {
         let size = core::mem::size_of_val(data);
         let new_buffer = self
             .device
-            .new_buffer_with_data(
-                data.as_ptr().cast(),
-                size,
-                MTLResourceOptions::StorageModeManaged,
-            )
+            .new_buffer_with_data(data.as_ptr().cast(), size, RESOURCE_OPTIONS)
             .map_err(MetalError::from)?;
         let mut buffers = self.buffers.write().map_err(MetalError::from)?;
 
-        let subbuffers = buffers
-            .entry((size, MTLResourceOptions::StorageModeManaged))
-            .or_insert(vec![]);
+        let subbuffers = buffers.entry(size).or_insert(vec![]);
 
         let new_buffer = Arc::new(new_buffer);
         subbuffers.push(new_buffer.clone());
@@ -191,42 +236,30 @@ impl MetalDevice {
     }
 
     pub fn allocate_zeros(&self, size_in_bytes: usize) -> Result<Arc<Buffer>> {
-        let buffer = self.allocate_buffer(
-            size_in_bytes,
-            MTLResourceOptions::StorageModePrivate,
-            "allocate_zeros",
-        )?;
-        let command_buffer = self.command_buffer()?;
-        command_buffer.set_label("zeros");
-        let blit = command_buffer.blit_command_encoder();
+        let buffer = self.allocate_buffer(size_in_bytes)?;
+        let blit = self.blit_command_encoder()?;
+        blit.set_label("zeros");
         blit.fill_buffer(&buffer, (0, buffer.length()), 0);
         blit.end_encoding();
         Ok(buffer)
     }
 
     /// The critical allocator algorithm
-    fn allocate_buffer(
-        &self,
-        size: usize,
-        option: MTLResourceOptions,
-        _name: &str,
-    ) -> Result<Arc<Buffer>> {
+    pub fn allocate_buffer(&self, size: usize) -> Result<Arc<Buffer>> {
         let mut buffers = self.buffers.write().map_err(MetalError::from)?;
-        if let Some(b) = find_available_buffer(size, option, &buffers) {
+        if let Some(b) = find_available_buffer(size, &buffers) {
             // Cloning also ensures we increment the strong count
             return Ok(b.clone());
         }
-
         let size = buf_size(size);
-        let subbuffers = buffers.entry((size, option)).or_insert(vec![]);
+        let subbuffers = buffers.entry(size).or_insert(vec![]);
 
         let new_buffer = self
             .device
-            .new_buffer(size, option)
+            .new_buffer(size, RESOURCE_OPTIONS)
             .map_err(MetalError::from)?;
         let new_buffer = Arc::new(new_buffer);
         subbuffers.push(new_buffer.clone());
-
         Ok(new_buffer)
     }
 
@@ -254,18 +287,47 @@ impl MetalDevice {
 }
 
 fn buf_size(size: usize) -> usize {
-    size.saturating_sub(1).next_power_of_two()
+    size.next_power_of_two()
 }
 
-fn find_available_buffer(
-    size: usize,
-    option: MTLResourceOptions,
-    buffers: &BufferMap,
-) -> Option<Arc<Buffer>> {
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_buf_size_exact_powers_of_two() {
+        assert_eq!(buf_size(1), 1);
+        assert_eq!(buf_size(2), 2);
+        assert_eq!(buf_size(4), 4);
+        assert_eq!(buf_size(8), 8);
+        assert_eq!(buf_size(16), 16);
+        assert_eq!(buf_size(1024), 1024);
+    }
+
+    #[test]
+    fn test_buf_size_rounds_up() {
+        assert_eq!(buf_size(3), 4);
+        assert_eq!(buf_size(5), 8);
+        assert_eq!(buf_size(6), 8);
+        assert_eq!(buf_size(7), 8);
+        assert_eq!(buf_size(9), 16);
+        assert_eq!(buf_size(1000), 1024);
+        assert_eq!(buf_size(1025), 2048);
+    }
+
+    #[test]
+    fn test_buf_size_bf16_f16_scalar() {
+        // BF16 and F16 are 2 bytes per element. A scalar tensor requests
+        // a 2-byte buffer. This must not be rounded down to 1.
+        assert_eq!(buf_size(2), 2);
+    }
+}
+
+fn find_available_buffer(size: usize, buffers: &BufferMap) -> Option<Arc<Buffer>> {
     let mut best_buffer: Option<&Arc<Buffer>> = None;
     let mut best_buffer_size = usize::MAX;
-    for ((buffer_size, buffer_option), subbuffers) in buffers.iter() {
-        if buffer_size >= &size && buffer_size < &best_buffer_size && buffer_option == &option {
+    for (buffer_size, subbuffers) in buffers.iter() {
+        if buffer_size >= &size && buffer_size < &best_buffer_size {
             for sub in subbuffers {
                 if Arc::strong_count(sub) == 1 {
                     best_buffer = Some(sub);
